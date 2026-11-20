@@ -122,7 +122,10 @@ Rules:
 - If static_info was requested and Static Context says no documents were found, state that you couldn't find that in the parking information.
 - If SQL Context is provided, include its facts directly. If the requested venue or time is unavailable, clearly list what parking venues, opening hours, and prices ARE available on that day from SQL Context.
 - If Missing/invalid reservation info is not "None", clearly and naturally ask the user to provide or fix every item listed there.
-- Do not claim a reservation is confirmed or finalized (a reservation still requires approval).
+- If Admin Decision is provided:
+  - If status is "approved", inform the user that the administrator approved their reservation and include the assigned slot, reservation period, and approval time if present.
+  - If status is "refused", politely inform the user that the administrator declined the reservation, include the reason if given, and offer to help with another venue or time.
+- If Admin Decision is "None", do not claim a reservation is confirmed or finalized (a reservation still requires administrator approval).
 - Keep the answer concise (short bullet points when combining multiple items).
 
 Conversation summary: {summary}
@@ -135,4 +138,30 @@ SQL Context: {sql_context}
 
 Reservation user info: {user_info}
 
-Missing/invalid reservation info: {missing_info}"""
+Missing/invalid reservation info: {missing_info}
+
+Admin Decision: {admin_decision}"""
+
+
+SQL_AVAILABILITY_PROMPT = """Inspect the SQL lookup conversation and tool results for this reservation request.
+Set slot_available=True ONLY if the returned database rows prove at least one slot (is_available=1) matches the requested venue, parking_date, and opening hours.
+If slot_available is True, set assigned_slot to one matching available slot_code (e.g. 'A01').
+Otherwise set slot_available=False and assigned_slot=null.
+Write a concise summary of the lookup (including available alternatives if unavailable)."""
+
+
+ADMIN_REQUEST_PROMPT = """You are the administrator-liaison agent for a Parking Space Reservation system.
+Draft a brief, clear reservation approval request for the human administrator containing:
+- Customer name and car registration number
+- Venue and assigned slot (if available)
+- Arrival and departure date/time
+- Brief note from the SQL availability check
+Keep it concise (3-5 short lines) and factual."""
+
+
+ADMIN_DECISION_PROMPT = """You are the administrator-liaison agent for a Parking Space Reservation system.
+Interpret the administrator's response to a parking reservation request.
+- Set status="approved" only if the administrator clearly confirms/approves the request.
+- Set status="refused" if the administrator declines, rejects, or does not clearly approve.
+- Extract any comment or refusal reason into reason.
+- Preserve approval_time if supplied; otherwise leave it null."""

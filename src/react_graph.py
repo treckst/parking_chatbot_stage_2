@@ -11,8 +11,13 @@ from langgraph.prebuilt import ToolNode
 from src.functions import redact_pii_rows
 from src.guardrails import SQLValidationError, safe_sql
 from src.models_vector import llm
-from src.prompts import SQL_AGENT_PROMPT
-from src.schema import SQLAgentInput, SQLAgentOutput, SQLAgentState
+from src.prompts import SQL_AGENT_PROMPT, SQL_AVAILABILITY_PROMPT
+from src.schema import (
+    SQLAgentInput,
+    SQLAgentOutput,
+    SQLAgentState,
+    SQLAvailabilityResult,
+)
 
 DB_URI = (
     (Path(__file__).parent.parent / "data" / "parking.db")
@@ -106,6 +111,7 @@ model_with_required_tool = llm.bind_tools(
     tool_choice="execute_readonly_sql",
 )
 tool_node = ToolNode([execute_readonly_sql], messages_key="sql_messages")
+availability_llm = llm.with_structured_output(SQLAvailabilityResult)
 
 
 def agent(state: SQLAgentState):
@@ -157,7 +163,26 @@ If no adequate result exists, explain that the lookup could not be completed.
     if response.tool_calls:
         return {"sql_messages": [response]}
 
-    return {"sql_messages": [response], "sql_result": response.text}
+    if reviewing_reservation:
+        check = availability_llm.invoke([
+            SystemMessage(content=SQL_AVAILABILITY_PROMPT),
+            HumanMessage(content=question),
+            *state.sql_messages,
+            response,
+        ])
+        return {
+            "sql_messages": [response],
+            "sql_result": check.summary,
+            "slot_available": check.slot_available,
+            "assigned_slot": check.assigned_slot if check.slot_available else None,
+        }
+
+    return {
+        "sql_messages": [response],
+        "sql_result": response.text,
+        "slot_available": False,
+        "assigned_slot": None,
+    }
 
 
 def tools(state: SQLAgentState):

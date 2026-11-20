@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
@@ -36,12 +36,40 @@ class UserInfoExtraction(BaseModel):
     reservation_period: ReservationPeriod = Field(default_factory=ReservationPeriod)
 
 
+class AdminDecision(BaseModel):
+    status: Literal["approved", "refused"] = Field(
+        description="Final administrator decision: 'approved' or 'refused'."
+    )
+    reason: str | None = Field(
+        default=None,
+        description="Optional administrator comment or refusal reason.",
+    )
+    approval_time: datetime | None = Field(
+        default=None,
+        description="UTC timestamp when the administrator approved the reservation.",
+    )
+
+
+class SQLAvailabilityResult(BaseModel):
+    summary: str = Field(description="Concise summary of the SQL availability lookup.")
+    slot_available: bool = Field(
+        description="True only if SQL results confirm at least one available slot matching the requested venue, date, and hours."
+    )
+    assigned_slot: str | None = Field(
+        default=None,
+        description="Selected available slot_code (e.g. 'A01') if slot_available is True, otherwise null.",
+    )
+
+
 class MainState(BaseModel):
     messages: Annotated[list[BaseMessage], add_messages] = Field(default_factory=list)
     summary: str = ""
     current_message: str = ""
     relevant_documents: list[str] = Field(default_factory=list)
     sql_result: str = ""
+    slot_available: bool = False
+    assigned_slot: str | None = None
+    admin_decision: AdminDecision | None = None
     user_info: UserState = Field(
         description="user's info for the reservation",
         default_factory=UserState,
@@ -76,11 +104,30 @@ class SQLAgentInput(BaseModel):
 
 class SQLAgentOutput(BaseModel):
     sql_result: str = ""
+    slot_available: bool = False
+    assigned_slot: str | None = None
 
 
 class SQLAgentState(SQLAgentInput, SQLAgentOutput):
     sql_calls: int = 0
     sql_messages: Annotated[list[BaseMessage], add_messages] = Field(default_factory=list)
+
+
+class AdminAgentInput(BaseModel):
+    user_info: UserState = Field(default_factory=UserState)
+    assigned_slot: str | None = None
+    sql_result: str = ""
+
+
+class AdminAgentOutput(BaseModel):
+    admin_decision: AdminDecision | None = None
+    user_info: UserState = Field(default_factory=UserState)
+
+
+class AdminAgentState(AdminAgentInput, AdminAgentOutput):
+    request_id: str | None = None
+    admin_request_message: str = ""
+    raw_admin_response: Any = None
 
 
 class UpgradedQuerySchema(BaseModel):

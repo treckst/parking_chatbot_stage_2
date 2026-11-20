@@ -10,6 +10,7 @@ from langgraph.graph.message import MessagesState
 
 load_dotenv()
 
+from src.admin_graph import admin_agent
 from src.functions import get_latest_human_message
 from src.guardrails import InputSanitizer
 from src.models_vector import llm, response_llm
@@ -163,20 +164,20 @@ def check_intent(state: MainState):
         "dynamic_question": intent.dynamic_question,
         "relevant_documents": [],
         "sql_result": "",
+        "slot_available": False,
+        "assigned_slot": None,
+        "admin_decision": None,
     }
 
 
 def route_after_intent(state: MainState):
     if state.wants_reservation:
         return "update_state"
-
-    targets = []
     if state.wants_static_info:
-        targets.append("retrieval")
+        return "retrieval"
     if state.wants_dynamic_info:
-        targets.append("sql_agent")
-
-    return targets if targets else "generate_response"
+        return "sql_agent"
+    return "generate_response"
 
 
 def update_state(state: MainState):
@@ -209,13 +210,23 @@ def update_state(state: MainState):
 
 
 def route_after_update(state: MainState):
-    targets = []
     if state.wants_static_info:
-        targets.append("retrieval")
+        return "retrieval"
     if state.wants_dynamic_info or not state.missing_info:
-        targets.append("sql_agent")
+        return "sql_agent"
+    return "generate_response"
 
-    return targets if targets else "generate_response"
+
+def route_after_retrieval(state: MainState):
+    if state.wants_dynamic_info or (state.wants_reservation and not state.missing_info):
+        return "sql_agent"
+    return "generate_response"
+
+
+def route_after_sql(state: MainState):
+    if state.wants_reservation and not state.missing_info and state.slot_available:
+        return "admin_agent"
+    return "generate_response"
 
 
 def generate_response(state: MainState):
@@ -240,9 +251,12 @@ def generate_response(state: MainState):
         "query": state.current_message,
         "static_context": static_context,
         "sql_context": state.sql_result or "None",
-        "user_info": state.user_info.model_dump() if state.wants_reservation else "None",
+        "user_info": state.user_info.model_dump(mode="json") if state.wants_reservation else "None",
         "missing_info": (
             ", ".join(state.missing_info) if state.wants_reservation and state.missing_info else "None"
+        ),
+        "admin_decision": (
+            state.admin_decision.model_dump(mode="json") if state.admin_decision else "None"
         ),
     })
     return {"messages": [AIMessage(content=answer)]}
@@ -256,6 +270,7 @@ workflow.add_node("check_intent", check_intent)
 workflow.add_node("update_state", update_state)
 workflow.add_node("retrieval", retrieval_graph)
 workflow.add_node("sql_agent", sql_agent)
+workflow.add_node("admin_agent", admin_agent)
 workflow.add_node("generate_response", generate_response)
 
 workflow.add_conditional_edges(START, route_entry, [
@@ -269,8 +284,13 @@ workflow.add_conditional_edges("check_intent", route_after_intent, [
 workflow.add_conditional_edges("update_state", route_after_update, [
     "retrieval", "sql_agent", "generate_response",
 ])
-workflow.add_edge("retrieval", "generate_response")
-workflow.add_edge("sql_agent", "generate_response")
+workflow.add_conditional_edges("retrieval", route_after_retrieval, [
+    "sql_agent", "generate_response",
+])
+workflow.add_conditional_edges("sql_agent", route_after_sql, [
+    "admin_agent", "generate_response",
+])
+workflow.add_edge("admin_agent", "generate_response")
 workflow.add_edge("generate_response", END)
 
 graph = workflow.compile()

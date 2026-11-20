@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "en-core-web-sm",
+    "fastapi>=0.165.0",
+    "httpx>=0.28.1",
     "langchain>=1.4.9",
     "langchain-chroma>=1.1.0",
     "langchain-classic>=1.0.8",
@@ -21,7 +23,11 @@ dependencies = [
     "pytest>=9.2.0",
     "python-dotenv>=1.2.4",
     "rank-bm25>=0.2.2",
+    "uvicorn>=0.54.0",
 ]
 
 [tool.uv.sources]
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

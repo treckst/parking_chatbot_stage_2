@@ -1,42 +1,77 @@
-# Parking Space Reservation Chatbot — Stage 1
+# Parking Space Reservation Chatbot — Stage 2 (Human-in-the-Loop Agent)
 
-An intelligent parking-space assistant built with **Python**, **LangChain**, and **LangGraph** as part of the *AI Solution Engineering: Fast Track Course (Module 9)*.
+An intelligent parking-space assistant built with **Python**, **LangChain**, **LangGraph**, and **FastAPI** as part of the *AI Solution Engineering: Fast Track Course (Module 9)*.
 
-Stage 1 delivers the core **Retrieval-Augmented Generation (RAG)** chatbot with a static/dynamic data split, interactive reservation intake, multi-layer guardrails (including local NLP PII redaction), automated evaluation, and CI tests.
+Stage 2 extends the Stage 1 RAG & SQL chatbot with a **Human-in-the-Loop (HITL) administrator approval agent** (`admin_agent` subgraph) backed by **LangGraph `interrupt()`** and a **FastAPI REST API** so validated, available reservations are automatically escalated to a human administrator and resumed once approved or refused.
 
 ---
 
-## Key Features (Stage 1)
+## Key Features
 
-- **Hybrid Static + Dynamic Architecture**
-  - **Static data (ChromaDB + BM25):** General parking information, locations, vehicle size rules, accessibility, EV charging, booking/cancellation policies, and privacy terms stored as PDFs and queried via an `EnsembleRetriever` (`0.60` dense OpenAI embeddings + `0.40` sparse BM25) with document grading and query-rewrite retries.
-  - **Dynamic data (SQLite):** Date-specific parking availability, opening hours, and hourly prices (`data/parking.db`, `parking_slots` table covering 1–30 November 2026 across 4 Łódź venues) queried by a bounded read-only ReAct SQL agent.
-- **Interactive Reservation Collection**
-  - Extracts and validates reservation fields across turns: **name**, **car registration number**, **parking venue/address**, and **reservation period** (arrival & departure date/time within November 2026).
-  - Automatically checks slot availability in SQL once all fields are valid and suggests available alternatives if the requested venue/time has no free slots.
-- **Guardrails & PII Protection**
-  - **Prompt injection defense:** Regex + delimiter sanitization (`InputSanitizer`) paired with an LLM security classifier (`SecutiryGuard`) at graph entry.
-  - **SQL safety:** Read-only SQLite URI (`?mode=ro`), SQLite authorizer restricted strictly to `SELECT` on `parking_slots`, `safe_sql` single-statement validation, 2-second execution timeout, 50-row cap, and a `MAX_SQL_CALLS = 3` tool-call budget.
-  - **Local NLP PII redaction:** Microsoft Presidio (`presidio-analyzer` + `presidio-anonymizer`) backed by spaCy's local `en_core_web_sm` model redacts sensitive entities (`PERSON`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `CREDIT_CARD`, `IBAN_CODE`, `US_SSN`, `IP_ADDRESS`) on both **vector DB retrieved documents** and **SQL tool rows** before they reach downstream LLMs.
-- **RAG Evaluation & Reporting**
-  - Reusable evaluation harness measuring `Recall@K`, `Precision@K`, `MRR@K`, and retrieval latency (`avg`, `p50`, `p95`, `max`) with an auto-generated Markdown report.
-- **Automated Tests & CI**
-  - 33 `pytest` unit tests across guardrails, PII redaction, and evaluation metrics, executed automatically on every push and pull request via GitHub Actions.
+### Stage 2 — Human-in-the-Loop Administrator Agent
+- **Dedicated Second LangChain Agent (`src/admin_graph.py`):** Compiled as a 3-node LangGraph subgraph (`send_request` → `wait_for_decision` → `process_decision`):
+  1. **`send_request`:** Uses LangChain (`ADMIN_REQUEST_PROMPT`) to draft a concise reservation approval request and sends it via the `send_admin_request` tool to the FastAPI Admin API, including the LangGraph `thread_id`.
+  2. **`wait_for_decision`:** Side-effect-free node calling LangGraph `interrupt(...)` to pause graph execution cleanly (resuming never duplicates the outbound API request).
+  3. **`process_decision`:** Interprets the administrator's reply (JSON from FastAPI or natural language from LangGraph Studio) into a structured `AdminDecision(status, reason, approval_time)` using LangChain structured output and updates `user_info.approval_time` when approved.
+- **FastAPI Administrator REST API (`src/admin_api.py`):**
+  - `POST /requests` — registers a pending reservation request and returns a `request_id` (e.g. `REQ-33774BEA`).
+  - `GET /requests` — lists requests (filterable by `?status=pending|approved|refused`).
+  - `GET /requests/{request_id}` — inspects an individual request.
+  - `POST /requests/{request_id}/decision` — records `approved` or `refused` with an optional comment and UTC `approval_time`, rejects duplicate decisions with `409 Conflict`, and **automatically resumes** the paused LangGraph Server thread (`POST /threads/{thread_id}/runs`).
+- **Conditional Escalation from Agent 1 → Agent 2:** `sql_agent` now returns structured `slot_available` and `assigned_slot` fields when reviewing a booking. `graph/graph.py` escalates to `admin_agent` **only** when all user reservation details are valid **and** SQL confirms an available slot.
+
+### Stage 1 — RAG Chatbot, Guardrails & Evaluation (Included)
+- **Static + Dynamic Data Split:** ChromaDB + BM25 hybrid retrieval (`0.60` / `0.40`) for 14 policy/location PDFs; read-only SQLite ReAct agent (`data/parking.db`) for November 2026 availability, opening hours, and hourly prices.
+- **Multi-Layer Guardrails:** Regex + LLM prompt-injection checks (`InputSanitizer`, `SecutiryGuard`), read-only SQL authorizer with call budget (`MAX_SQL_CALLS = 3`), and local NLP PII redaction via **Microsoft Presidio + spaCy `en_core_web_sm`** on both vector DB chunks and SQL rows.
+- **RAG Evaluation & CI:** Automated `Recall@K`, `Precision@K`, `MRR`, and latency reporting ([eval/report.md](eval/report.md)) plus 39 `pytest` unit tests running on GitHub Actions.
 
 ---
 
 ## Architecture
 
-![Stage 1 LangGraph Architecture](docs/architecture.jpg)
+```mermaid
+flowchart TD
+    START([START]) --> RE{route_entry}
+    RE -->|injection / unsafe| SEC[security_stoppage] --> END1([END])
+    RE -->|len > 15| SUM[summarize_conversation] --> CI[check_intent]
+    RE -->|safe| CI
 
-The main workflow ([graph/graph.py](graph/graph.py)) orchestrates:
+    CI -->|wants_reservation| US[update_state]
+    CI -->|static_info| RET[retrieval subgraph]
+    CI -->|dynamic_info| SQL[sql_agent subgraph]
+    CI -->|none| GEN[generate_response]
 
-1. **Entry & Guardrails (`route_entry` → `security_stoppage` / `summarize_conversation`):** Sanitizes input and checks for prompt injection or policy violations. Summarizes history automatically once conversation length exceeds 15 messages.
-2. **Intent Classification (`check_intent`):** Independently classifies each turn into `static_info`, `dynamic_info`, and/or `reservation`, allowing combined requests in a single message.
-3. **Reservation Intake (`update_state`):** Merges newly extracted fields with existing `UserState` and validates completeness/date rules (`validate_reservation`).
-4. **Static Retrieval Subgraph ([src/retrieval_graph.py](src/retrieval_graph.py)):** Optimizes the query → runs hybrid dense + BM25 search + `redact_pii` → grades retrieved documents → rewrites the query and retries up to `MAX_RETRIES = 3` if no relevant documents pass.
-5. **Dynamic SQL Subgraph ([src/react_graph.py](src/react_graph.py)):** ReAct agent calling `execute_readonly_sql` (with `redact_pii_rows` applied to returned rows) within a budget of `MAX_SQL_CALLS = 3`.
-6. **Final Response (`generate_response`):** Synthesizes static context, SQL facts, and any missing/invalid reservation fields into a concise reply without falsely confirming unapproved bookings.
+    US -->|static_info| RET
+    US -->|dynamic_info or complete| SQL
+    US -->|missing_info| GEN
+
+    RET -->|dynamic_info or ready booking| SQL
+    RET -->|static only| GEN
+
+    SQL -->|ready booking & slot_available| ADM[admin_agent subgraph]
+    SQL -->|unavailable or info only| GEN
+
+    subgraph HITL["Stage 2: Human-in-the-Loop (src/admin_graph.py)"]
+        ADM1[send_request<br/>POST /requests] --> ADM2[wait_for_decision<br/>LangGraph interrupt]
+        ADM2 -->|FastAPI decision auto-resume<br/>or Studio Resume| ADM3[process_decision<br/>AdminDecision]
+    end
+
+    ADM --> GEN --> END2([END])
+```
+
+---
+
+## Screenshots (Live End-to-End Demo)
+
+### 1. LangGraph Studio — Escalation, Resume & User Confirmation
+The main graph validates the reservation, checks availability via `sql_agent`, escalates to `admin_agent`, pauses on `interrupt()`, and resumes automatically once the administrator approves `REQ-33774BEA` via FastAPI to deliver the final confirmation:
+
+![LangGraph Studio Stage 2 Approval Flow](docs/langsmith.png)
+
+### 2. FastAPI Admin REST API (`/docs`) — Decision & Duplicate Protection
+The administrator reviews pending requests and submits approve/refuse decisions directly via FastAPI's interactive Swagger UI (`POST /requests/{request_id}/decision`). Re-submitting an already processed request is safely rejected with `409 Conflict`:
+
+![FastAPI Admin API Swagger Decision Endpoint](docs/image.png)
 
 ---
 
@@ -45,37 +80,42 @@ The main workflow ([graph/graph.py](graph/graph.py)) orchestrates:
 ```text
 parking_project/
 ├── .github/workflows/
-│   └── tests.yml                # GitHub Actions CI (uv sync + pytest)
+│   └── tests.yml                # GitHub Actions CI (uv sync --locked + pytest)
 ├── data/
 │   ├── chroma_db/               # Persisted Chroma vector database (static PDFs)
 │   └── parking.db               # SQLite database (dynamic slots, prices, hours)
 ├── docs/
-│   └── architecture.jpg         # Stage 1 LangGraph workflow diagram
+│   ├── image.png                # FastAPI Admin API decision screenshot
+│   └── langsmith.png            # LangGraph Studio end-to-end approval screenshot
 ├── eval/
 │   ├── dataset.json             # 12 ground-truth RAG evaluation queries
 │   ├── evaluate_rag.py          # Recall@K, Precision@K, MRR, latency evaluator
 │   └── report.md                # Generated RAG evaluation report
 ├── graph/
-│   └── graph.py                 # Main LangGraph workflow entry point
+│   └── graph.py                 # Main LangGraph workflow orchestrating all subgraphs
 ├── seed_ingest/
 │   ├── pdfs/                    # 14 fictional parking policy & location PDFs
 │   ├── dynamic_data.py          # Generates data/parking.db (360 November 2026 slots)
 │   └── static_data.py           # Ingests PDFs into data/chroma_db
 ├── src/
+│   ├── admin_api.py             # Stage 2: FastAPI REST API + LangGraph auto-resume
+│   ├── admin_graph.py           # Stage 2: Human-in-the-Loop admin approval subgraph
 │   ├── functions.py             # Retrievers, helpers, Presidio/spaCy PII redaction
 │   ├── guardrails.py            # InputSanitizer and safe_sql validation
 │   ├── models_vector.py         # OpenAI LLM/embedding & Chroma initialization
-│   ├── prompts.py               # System prompts for routing, RAG, SQL, responses
-│   ├── react_graph.py           # Read-only SQL ReAct subgraph
+│   ├── prompts.py               # Prompts for routing, RAG, SQL, admin agent, responses
+│   ├── react_graph.py           # Read-only SQL ReAct subgraph + availability check
 │   ├── retrieval_graph.py       # Hybrid RAG + grading/rewrite subgraph
-│   ├── schema.py                # Pydantic state & structured-output schemas
+│   ├── schema.py                # Pydantic state, SQL availability & AdminDecision schemas
 │   └── security.py              # LLM-based SecutiryGuard classifier
 ├── tests/
-│   ├── test_eval.py             # Unit tests for RAG evaluation metrics & runner
-│   ├── test_guards.py           # Unit tests for injection detection & sanitization
-│   └── test_pii.py              # Unit tests for NLP PII redaction & SQL row filtering
+│   ├── test_admin_api.py        # FastAPI Admin API & auto-resume unit tests
+│   ├── test_admin_graph.py      # Admin subgraph interrupt(), idempotency & decision tests
+│   ├── test_eval.py             # RAG evaluation metrics & report unit tests
+│   ├── test_guards.py           # Prompt-injection detection & sanitization tests
+│   └── test_pii.py              # Presidio + spaCy PII redaction & SQL row tests
 ├── langgraph.json               # LangGraph Server / Studio configuration
-├── pyproject.toml               # Project dependencies (managed by uv)
+├── pyproject.toml               # Dependencies & pytest config (managed by uv)
 └── uv.lock                      # Cross-platform lockfile
 ```
 
@@ -86,7 +126,7 @@ parking_project/
 ### Prerequisites
 - Python **3.12**
 - [uv](https://docs.astral.sh/uv/) package manager
-- An OpenAI API key (`OPENAI_API_KEY`)
+- OpenAI API key (`OPENAI_API_KEY`)
 
 ### 1. Clone & Install Dependencies
 ```bash
@@ -95,19 +135,19 @@ cd parking_project
 uv sync --locked
 ```
 
-> `uv sync --locked` installs all Python dependencies including `presidio-analyzer`, `presidio-anonymizer`, and the local spaCy model `en-core-web-sm`.
-
 ### 2. Configure Environment Variables
 Create a `.env` file in the project root:
 ```env
 OPENAI_API_KEY=your_openai_api_key
-# Optional: LangSmith tracing
-# LANGSMITH_TRACING=true
-# LANGSMITH_API_KEY=your_langsmith_key
+
+# Optional overrides (defaults shown)
+ADMIN_API_URL=http://127.0.0.1:8000
+LANGGRAPH_API_URL=http://127.0.0.1:2024
+LANGGRAPH_ASSISTANT_ID=graph
 ```
 
 ### 3. (Optional) Regenerate Data Fixtures
-Pre-seeded `data/parking.db` and `data/chroma_db/` are included. To rebuild them from scratch, remove the existing files and run:
+Pre-seeded `data/parking.db` and `data/chroma_db/` are included. To rebuild them from scratch:
 ```bash
 uv run python -m seed_ingest.dynamic_data
 uv run python -m seed_ingest.static_data
@@ -115,40 +155,43 @@ uv run python -m seed_ingest.static_data
 
 ---
 
-## Usage
+## Usage (Running Stage 2 End-to-End)
 
-### Run with LangGraph Studio / Dev Server
-Install the LangGraph CLI (if not already installed in your environment) and launch the local dev server configured in [langgraph.json](langgraph.json):
+Start both local servers in separate terminals:
+
 ```bash
+# Terminal 1 — FastAPI Admin REST API (Swagger UI at http://127.0.0.1:8000/docs)
+uv run uvicorn src.admin_api:app --port 8000
+
+# Terminal 2 — LangGraph Dev Server / Studio (port 2024)
 uv pip install "langgraph-cli[inmem]"
 uv run langgraph dev
 ```
 
-### Invoke Programmatically
-```python
-from langchain_core.messages import HumanMessage
-from graph.graph import graph
-
-result = graph.invoke({
-    "messages": [
-        HumanMessage(content="Where is Manufaktura parking and is it available on 2026-11-15 from 10:00 to 14:00?")
-    ]
-})
-print(result["messages"][-1].content)
-```
+### Approval Workflow
+1. **User submits reservation details** in LangGraph Studio (name, car plate, venue, date, arrival & departure time).
+2. **`sql_agent` verifies availability** in `data/parking.db` and selects an available slot (e.g. `B01`).
+3. **`admin_agent` sends the request** (`POST /requests`) to FastAPI and pauses via `interrupt()`.
+4. **Administrator reviews & decides** via FastAPI Swagger (`http://127.0.0.1:8000/docs`) or HTTP:
+   - List pending requests: `GET /requests?status=pending`
+   - Approve or refuse:
+     ```bash
+     curl -X POST http://127.0.0.1:8000/requests/<REQUEST_ID>/decision \
+       -H "Content-Type: application/json" \
+       -d '{"decision": "approved", "comment": "Approved"}'
+     ```
+5. **Auto-resume & user reply:** FastAPI records the decision with a UTC `approval_time` and automatically resumes the paused LangGraph thread so the chatbot delivers the final confirmation (or refusal reason) to the user.
 
 ---
 
-## RAG Evaluation
+## RAG Evaluation (Stage 1 Baseline)
 
-Run the evaluation baseline against the production hybrid retriever (`Chroma` + `BM25`) and local Presidio PII redaction:
+Re-run the retrieval evaluation against [eval/dataset.json](eval/dataset.json):
 ```bash
 uv run python -m eval.evaluate_rag
 ```
 
-### Latest Results ([eval/report.md](eval/report.md))
-
-Evaluated on 12 queries in [eval/dataset.json](eval/dataset.json):
+Latest measured metrics ([eval/report.md](eval/report.md)):
 
 | Metric | @1 | @4 |
 | --- | ---: | ---: |
@@ -160,29 +203,28 @@ Evaluated on 12 queries in [eval/dataset.json](eval/dataset.json):
 | ---: | ---: | ---: | ---: |
 | 426.2 ms | 199.9 ms | 1339.6 ms | 2247.3 ms |
 
-> Note: With 9 single-source queries and 3 two-source queries, the theoretical maximum `Precision@4` is `0.3125` — the retriever achieves `1.000` MRR and `1.000` Recall@4 across all 12 queries.
-
 ---
 
 ## Testing & CI/CD
 
-Run the full test suite locally:
+Run the full automated test suite (runs completely offline with no API key required):
 ```bash
-uv run python -m pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
-| Test Module | Coverage |
-| --- | --- |
-| [tests/test_guards.py](tests/test_guards.py) | Prompt-injection regex detection and input sanitization |
-| [tests/test_pii.py](tests/test_pii.py) | Local Presidio + spaCy PII redaction, public parking allow-list preservation, and SQL row sanitization |
-| [tests/test_eval.py](tests/test_eval.py) | `Recall@K`, `Precision@K`, `MRR@K`, percentiles, evaluator runner, and report generation |
+| Test Module | Tests | Coverage |
+| --- | ---: | --- |
+| [tests/test_admin_api.py](tests/test_admin_api.py) | 4 | Request creation/listing, approve/refuse, `404`/`409` handling, LangGraph auto-resume callback |
+| [tests/test_admin_graph.py](tests/test_admin_graph.py) | 2 | Subgraph `interrupt()` pause & `Command(resume=...)`, idempotency, approved/refused parsing |
+| [tests/test_eval.py](tests/test_eval.py) | 4 | `Recall@K`, `Precision@K`, `MRR@K`, percentiles, evaluator runner & report generation |
+| [tests/test_guards.py](tests/test_guards.py) | 24 | Prompt-injection regex detection and input sanitization |
+| [tests/test_pii.py](tests/test_pii.py) | 5 | Local Presidio + spaCy PII redaction, public parking allow-list, SQL row sanitization |
 
-GitHub Actions ([.github/workflows/tests.yml](.github/workflows/tests.yml)) automatically installs Python 3.12, syncs locked dependencies via `uv sync --locked` (with caching), and runs `pytest` on every push and pull request.
+GitHub Actions ([.github/workflows/tests.yml](.github/workflows/tests.yml)) automatically runs `uv sync --locked` and `uv run python -m pytest tests/ -v` on every push and pull request.
 
 ---
 
 ## Roadmap
 
-- **Stage 2:** Human-in-the-Loop administrator approval agent (escalate validated reservation requests and receive approve/reject decisions).
 - **Stage 3:** Secure MCP server to persist approved reservations (`Name | Car Number | Reservation Period | Approval Time`).
-- **Stage 4:** End-to-end LangGraph orchestration of all agents and MCP recording with integration and load testing.
+- **Stage 4:** Full end-to-end LangGraph orchestration with MCP recording, load testing, and integration tests.
